@@ -225,10 +225,47 @@ def crawl_paginated_table(session, start_url, params=None, container_selector='.
             data[name] = value
         return data
 
+    def extract_player_ids_from_soup(soup_obj, container_selector):
+        """Return list of playerId strings ('' if not found) in the same order as tbody tr rows."""
+        ids = []
+        container = None
+        try:
+            if container_selector:
+                container = soup_obj.select_one(container_selector) or soup_obj
+            else:
+                container = soup_obj
+            # try to find the first table within the container
+            table = container.find('table') if container else soup_obj.find('table')
+            if not table:
+                return ids
+            tbody = table.find('tbody') or table
+            for tr in tbody.find_all('tr'):
+                tds = tr.find_all(['td', 'th'])
+                if len(tds) >= 2:
+                    second = tds[1]
+                    a = second.find('a')
+                    href = a.get('href') if a else ''
+                    if href:
+                        m = None
+                        # try to find numeric playerId in query string
+                        import re
+
+                        m = re.search(r'playerId=(\d+)', href)
+                        if m:
+                            ids.append(m.group(1))
+                            continue
+                    # fallback: empty string
+                    ids.append('')
+                else:
+                    ids.append('')
+        except Exception:
+            logging.exception('Error extracting player ids from soup')
+        return ids
+
     base_form = collect_hidden_inputs(soup)
 
     # If select params were provided (e.g., season/team), POST them to get the page in the selected state
-    collected = []
+    collected_pages = []  # list of tuples (DataFrame, [player_id,...])
     if params:
         # merge hidden inputs and params into form and POST
         form = base_form.copy()
@@ -241,14 +278,16 @@ def crawl_paginated_table(session, start_url, params=None, container_selector='.
         # update base_form from the POST response
         base_form.update(collect_hidden_inputs(soup))
         df = extract_table_from_html(r.text)
+        ids = extract_player_ids_from_soup(soup, container_selector)
         if df is not None:
-            collected.append(df)
+            collected_pages.append((df, ids))
         resp = r
     else:
         # find tables on first page (no select POST needed)
         df = extract_table_from_html(resp.text)
+        ids = extract_player_ids_from_soup(soup, container_selector)
         if df is not None:
-            collected.append(df)
+            collected_pages.append((df, ids))
 
     # find pager
     paging = soup.select_one('.paging')
@@ -282,9 +321,11 @@ def crawl_paginated_table(session, start_url, params=None, container_selector='.
         logging.info('Fetching page %s', pu)
         r = session.get(pu, headers=HEADERS, timeout=30)
         r.raise_for_status()
+        soup_p = BeautifulSoup(r.text, 'lxml')
         dfp = extract_table_from_html(r.text)
+        ids_p = extract_player_ids_from_soup(soup_p, container_selector)
         if dfp is not None:
-            collected.append(dfp)
+            collected_pages.append((dfp, ids_p))
         time.sleep(1)
 
     # Now handle ASP.NET postback pager links by submitting form data
@@ -312,13 +353,32 @@ def crawl_paginated_table(session, start_url, params=None, container_selector='.
         soup2 = BeautifulSoup(r.text, 'lxml')
         base_form.update(collect_hidden_inputs(soup2))
         dfp = extract_table_from_html(r.text)
+        ids_p = extract_player_ids_from_soup(soup2, container_selector)
         if dfp is not None:
-            collected.append(dfp)
+            collected_pages.append((dfp, ids_p))
         time.sleep(1)
 
-    if not collected:
+    if not collected_pages:
         return None
-    combined = pd.concat(collected, ignore_index=True)
+
+    # For each collected page, attempt to attach player_id column if ids length matches
+    processed_dfs = []
+    for df_page, ids in collected_pages:
+        try:
+            if ids and len(ids) == len(df_page):
+                df_page.insert(0, 'player_id', ids)
+            else:
+                # try to align by name if ids length differs
+                if ids and len(ids) != len(df_page):
+                    logging.warning('Mismatch between extracted player ids (%d) and table rows (%d) for %s', len(ids), len(df_page), start_url)
+                # insert empty id column to preserve schema
+                df_page.insert(0, 'player_id', [''] * len(df_page))
+        except Exception:
+            logging.exception('Failed to attach player_id for a page, inserting empty column')
+            df_page.insert(0, 'player_id', [''] * len(df_page))
+        processed_dfs.append(df_page)
+
+    combined = pd.concat(processed_dfs, ignore_index=True)
     return combined
 
 

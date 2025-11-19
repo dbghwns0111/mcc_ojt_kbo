@@ -26,7 +26,7 @@ LOG = logging.getLogger("enrich_player_attributes")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 BASE = "https://www.koreabaseball.com"
-INPUT_CSV = Path("data") / "player_attributes.csv"
+INPUT_CSV = Path(__file__).resolve().parent.parent / "data" / "player_info" / "player_attributes.csv"
 
 def detect_id_column(df: pd.DataFrame):
     for col in df.columns:

@@ -226,40 +226,56 @@ def crawl_paginated_table(session, start_url, params=None, container_selector='.
         return data
 
     def extract_player_ids_from_soup(soup_obj, container_selector):
-        """Return list of playerId strings ('' if not found) in the same order as tbody tr rows."""
+        """Return list of playerId strings ('' if not found) in the same order as tbody tr rows.
+
+        Look specifically under:
+        div.sub-content > div[id*=cphContents...udpContent] > div.record_result > table > tbody > tr
+        and extract the numeric `playerId` query param from the second td's anchor.
+        """
         ids = []
-        container = None
         try:
-            if container_selector:
-                container = soup_obj.select_one(container_selector) or soup_obj
-            else:
-                container = soup_obj
-            # try to find the first table within the container
-            table = container.find('table') if container else soup_obj.find('table')
+            # start from the sub-content area if present
+            sub = soup_obj.select_one('div.sub-content') or soup_obj
+
+            # prefer the inner content div whose id contains 'cphContents' or 'udpContent'
+            content_div = None
+            for d in sub.find_all('div', id=True):
+                iid = d.get('id', '')
+                if 'udpContent' in iid or iid.startswith('cphContents') or 'cphContents' in iid:
+                    content_div = d
+                    break
+            if not content_div:
+                # fallback: any div with id containing cphContents
+                content_div = sub.find('div', id=lambda x: x and 'cphContents' in x) or sub
+
+            # find the record_result container
+            record = content_div.find('div', class_='record_result') if content_div else None
+            if not record:
+                # fallback alternatives
+                record = content_div.find('div', class_='record') if content_div else None
+            # find the first table inside the record_result
+            table = record.find('table') if record else (content_div.find('table') if content_div else soup_obj.find('table'))
             if not table:
                 return ids
             tbody = table.find('tbody') or table
-            for tr in tbody.find_all('tr'):
+            rows = tbody.find_all('tr')
+
+            import re
+            for tr in rows:
                 tds = tr.find_all(['td', 'th'])
                 if len(tds) >= 2:
                     second = tds[1]
-                    a = second.find('a')
-                    href = a.get('href') if a else ''
+                    a = second.find('a', href=True)
+                    href = a['href'] if a else ''
                     if href:
-                        m = None
-                        # try to find numeric playerId in query string
-                        import re
-
                         m = re.search(r'playerId=(\d+)', href)
                         if m:
                             ids.append(m.group(1))
                             continue
-                    # fallback: empty string
-                    ids.append('')
-                else:
-                    ids.append('')
+                # default empty when not found
+                ids.append('')
         except Exception:
-            logging.exception('Error extracting player ids from soup')
+            logging.exception('Error extracting player ids from soup (record_result path)')
         return ids
 
     base_form = collect_hidden_inputs(soup)

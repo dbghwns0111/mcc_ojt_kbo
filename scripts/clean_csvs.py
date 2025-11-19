@@ -33,8 +33,10 @@ def process_file(path):
         return (path, before_rows, 0, 0, 'no_columns')
 
     # Drop first column (rank) by position
-    if df.shape[1] >= 1:
-        df = df.iloc[:, 1:]
+    # 두 번째 열(인덱스 1)을 제거하고, 나머지 열(인덱스 0과 인덱스 2부터 끝까지)을 선택합니다.
+    if df.shape[1] >= 2:
+        # 첫 번째 열(인덱스 0)과 세 번째 열(인덱스 2)부터 끝까지를 선택합니다.
+        df = pd.concat([df.iloc[:, [0]], df.iloc[:, 2:]], axis=1)
 
     # Drop duplicate rows
     df_before_dup = len(df)

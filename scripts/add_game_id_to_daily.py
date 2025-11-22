@@ -1,235 +1,223 @@
 #!/usr/bin/env python3
-"""Add `game_id` column to year hitter/pitcher daily files using player_team_history and games_all mapping.
-
-Usage: python scripts\add_game_id_to_daily.py
-
-This will process years 2021..2025 and overwrite the daily CSVs with an additional `game_id` column as the first column.
 """
+Add `GAME_ID` column to hitter/pitcher daily files by matching:
+
+- daily.GAME_DATE  ↔  Games_all.GAME_DATE
+- daily.OPPONENT   ↔  Games_all.TEAM_AWAY or TEAM_HOME
+
+매칭되면 해당 Games_all 행의 GAME_ID를 daily 파일의 첫 번째 컬럼(GAME_ID)으로 추가한다.
+
+전제:
+- 통합된 Games_all 파일: data_etl/all_years_Games_all.csv
+  - 주요 컬럼: GAME_ID, GAME_DATE, TEAM_AWAY, TEAM_HOME
+
+- daily 파일들:
+  - data_etl/all_years_hitter_daily.csv
+  - data_etl/all_years_pitcher_daily.csv
+  - data/{year}/player_stats/{year}_hitter_daily.csv
+  - data/{year}/player_stats/{year}_pitcher_daily.csv
+
+Usage:
+    python scripts/add_game_id_to_daily.py
+"""
+
 import os
 import csv
 from datetime import datetime
-from collections import defaultdict, Counter
 
+# 프로젝트 루트 경로 (현재 스크립트 기준 상위 폴더)
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-PTH_PLAYER_HISTORY = os.path.join(ROOT, 'data', 'player_info', 'player_team_history.csv')
+
+# 통합 Games_all 파일
 PTH_ALL_GAMES = os.path.join(ROOT, 'data_etl', 'all_years_Games_all.csv')
+
+# 통합 daily 파일
 PTH_ALL_HITTER = os.path.join(ROOT, 'data_etl', 'all_years_hitter_daily.csv')
 PTH_ALL_PITCHER = os.path.join(ROOT, 'data_etl', 'all_years_pitcher_daily.csv')
+
+# 연도별 처리용
 YEARS = [2021, 2022, 2023, 2024, 2025]
 
 
-def load_player_history(path):
-    # returns dict player_id -> list of (start_date, end_date, team)
-    out = defaultdict(list)
-    if not os.path.exists(path):
-        return out
-    with open(path, newline='', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            pid = r.get('player_id')
-            team = r.get('team')
-            sd = r.get('start_date')
-            ed = r.get('end_date')
-            try:
-                sd_dt = datetime.fromisoformat(sd).date()
-                ed_dt = datetime.fromisoformat(ed).date()
-            except Exception:
-                continue
-            out[pid].append((sd_dt, ed_dt, team))
-    # sort intervals per player
-    for pid in out:
-        out[pid].sort()
-    return out
-
-
-def build_team_abbrev_map(games_all_path):
-    # returns mapping team_name -> most common 2-letter abbrev found in game_id
-    mapping_counts = defaultdict(Counter)
-    if not os.path.exists(games_all_path):
-        return {}
-    with open(games_all_path, newline='', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            gid = r.get('game_id', '')
-            if len(gid) < 12:
-                continue
-            away_abbr = gid[8:10]
-            home_abbr = gid[10:12]
-            team_away = r.get('team_away')
-            team_home = r.get('team_home')
-            if team_away:
-                mapping_counts[team_away][away_abbr] += 1
-            if team_home:
-                mapping_counts[team_home][home_abbr] += 1
-    result = {}
-    for team, counter in mapping_counts.items():
-        if not counter:
-            continue
-        # pick most common abbrev
-        abbr, _ = counter.most_common(1)[0]
-        result[team] = abbr
-    return result
-
-
-def build_games_index_and_abbr(etl_games_path):
-    """Load the ETL games file and return:
-    - team_abbr_map: team_name -> abbr
-    - games_index: dict of (ymd, away_abbr, home_abbr) -> game_id
-    - abbr_set: set of all seen abbreviations
+def normalize_date(s: str) -> str:
     """
-    mapping_counts = defaultdict(Counter)
-    games_index = {}
-    abbr_set = set()
-    if not os.path.exists(etl_games_path):
-        return {}, {}, set()
-    with open(etl_games_path, newline='', encoding='utf-8-sig') as f:
+    GAME_DATE 문자열을 키로 쓰기 위해 정규화하는 함수.
+
+    - 기본 전략:
+      1) 양 끝 공백 제거
+      2) ISO 형식(YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS 등)이면
+         date 부분만 뽑아서 YYYY-MM-DD 로 통일
+      3) 실패하면 원문 그대로 사용 (daily와 games_all이 같은 형식이면 그대로 매칭 가능)
+
+    이 함수는 games_all 쪽과 daily 쪽 모두에 동일하게 적용되어야 한다.
+    """
+    if s is None:
+        return ''
+    s = str(s).strip()
+    if not s:
+        return ''
+    try:
+        # fromisoformat은 "YYYY-MM-DD" 또는 "YYYY-MM-DDTHH:MM:SS" 등 지원
+        dt = datetime.fromisoformat(s)
+        return dt.date().isoformat()
+    except Exception:
+        # 파싱 실패 시 원본 문자열로 매칭 시도
+        return s
+
+
+def build_games_index_by_date_and_team(games_path):
+    """
+    all_years_Games_all.csv 파일에서 다음과 같은 인덱스를 구축한다.
+
+    key:   (norm_game_date, team_name)
+           - norm_game_date = normalize_date(GAME_DATE)
+           - team_name = TEAM_AWAY 또는 TEAM_HOME (좌우 공백 제거)
+
+    value: GAME_ID
+
+    같은 (날짜, 팀) 조합이 여러 번 등장할 경우,
+    가장 먼저 등장한 GAME_ID를 사용한다. (더블헤더 등은 단순 매칭)
+    """
+    index = {}
+
+    if not os.path.exists(games_path):
+        print(f"[WARN] Games_all file not found: {games_path}")
+        return index
+
+    with open(games_path, newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for r in reader:
-            gid = r.get('game_id', '')
-            date_s = r.get('date') or r.get('game_date')
-            if not date_s:
+            # GAME_ID 컬럼 이름은 대문자 기준으로 우선, 소문자도 백업으로 지원
+            game_id = r.get('GAME_ID') or r.get('game_id')
+            if not game_id:
                 continue
-            # extract abbr from game_id if possible
-            if len(gid) >= 12:
-                away_abbr = gid[8:10]
-                home_abbr = gid[10:12]
-            else:
-                away_abbr = ''
-                home_abbr = ''
-            team_away = r.get('team_away')
-            team_home = r.get('team_home')
-            if team_away and away_abbr:
-                mapping_counts[team_away][away_abbr] += 1
-                abbr_set.add(away_abbr)
-            if team_home and home_abbr:
-                mapping_counts[team_home][home_abbr] += 1
-                abbr_set.add(home_abbr)
-            # normalize date to yyyymmdd
-            try:
-                ymd = datetime.fromisoformat(date_s).strftime('%Y%m%d')
-            except Exception:
+
+            # GAME_DATE 컬럼에서 날짜를 읽고 정규화
+            game_date_raw = r.get('GAME_DATE') or r.get('game_date') or r.get('date')
+            if not game_date_raw:
                 continue
-            if away_abbr and home_abbr:
-                games_index[(ymd, away_abbr, home_abbr)] = gid
+            date_key = normalize_date(game_date_raw)
+            if not date_key:
+                continue
 
-    team_abbr = {}
-    for team, counter in mapping_counts.items():
-        if not counter:
-            continue
-        abbr, _ = counter.most_common(1)[0]
-        team_abbr[team] = abbr
+            # TEAM_AWAY / TEAM_HOME 을 모두 인덱스로 등록
+            for col in ('TEAM_AWAY', 'team_away', 'TEAM_HOME', 'team_home'):
+                team = r.get(col)
+                if not team:
+                    continue
+                team_key = str(team).strip()
+                if not team_key:
+                    continue
 
-    return team_abbr, games_index, abbr_set
+                key = (date_key, team_key)
+                # 이미 동일 key가 있으면 첫 값 유지 (overwrite 방지)
+                if key not in index:
+                    index[key] = game_id
 
-
-def find_player_team_at(player_history, pid, date_obj):
-    intervals = player_history.get(pid)
-    if not intervals:
-        return None
-    for sd, ed, team in intervals:
-        if sd <= date_obj <= ed:
-            return team
-    return None
+    print(f"[INFO] Built games index with {len(index)} (date, team) entries.")
+    return index
 
 
-def process_daily_file(path, player_history, team_abbr_map):
-    # read and write with game_id as first column
+def process_daily_file(path, games_index):
+    """
+    단일 daily CSV 파일에 대해 GAME_ID 컬럼을 추가하는 함수.
+
+    매칭 규칙:
+    - daily의 날짜:   GAME_DATE / game_date / date / 일자 중 하나
+    - daily의 상대팀: OPPONENT / opponent / 상대 중 하나
+    - 키: (normalize_date(daily_date), opponent)
+
+    games_index[(날짜, 상대팀)] 에서 GAME_ID를 찾아
+    daily 파일의 첫 번째 컬럼인 GAME_ID 로 기록한다.
+
+    이미 GAME_ID 또는 game_id 컬럼이 존재하면 해당 파일은 스킵한다.
+    """
     if not os.path.exists(path):
         return 0
+
     tmp_path = path + '.tmp'
     rows_processed = 0
-    # support passing combined tuple (team_map, games_index, abbr_set)
-    if isinstance(team_abbr_map, tuple):
-        team_map, games_index, abbr_set = team_abbr_map
-    else:
-        team_map = team_abbr_map or {}
-        games_index = None
-        abbr_set = set()
-    with open(path, newline='', encoding='utf-8-sig') as fr, open(tmp_path, 'w', newline='', encoding='utf-8-sig') as fw:
+
+    with open(path, newline='', encoding='utf-8-sig') as fr, \
+            open(tmp_path, 'w', newline='', encoding='utf-8-sig') as fw:
+
         reader = csv.DictReader(fr)
         fieldnames = reader.fieldnames.copy() if reader.fieldnames else []
-        if 'game_id' in fieldnames:
-            # already processed
+
+        # 이미 GAME_ID / game_id 컬럼이 있으면 재처리하지 않음
+        if 'GAME_ID' in fieldnames or 'game_id' in fieldnames:
+            print(f"[SKIP] {path} already has GAME_ID/game_id column.")
             return 0
-        out_fields = ['game_id'] + fieldnames
+
+        # GAME_ID를 맨 앞 컬럼으로 추가
+        out_fields = ['GAME_ID'] + fieldnames
         writer = csv.DictWriter(fw, fieldnames=out_fields)
         writer.writeheader()
+
         for r in reader:
-            pid = str(r.get('PLAYER_ID') or r.get('player_id') or r.get('선수_ID') or '').strip()
-            # support multiple date/opponent column names
-            date_s = r.get('GAME_DATE') or r.get('date') or r.get('일자') or r.get('game_date')
-            opp = r.get('OPPONENT') or r.get('opponent') or r.get('상대') or ''
-            try:
-                dobj = datetime.fromisoformat(date_s).date()
-            except Exception:
-                game_id = ''
-                newrow = {k: v for k, v in r.items()}
-                newrow['game_id'] = game_id
-                writer.writerow(newrow)
-                continue
-            # find player's team at date
-            player_team = find_player_team_at(player_history, pid, dobj)
+            # 날짜 컬럼 추출 (우선순위: GAME_DATE)
+            date_s = (
+                r.get('GAME_DATE')
+                or r.get('game_date')
+                or r.get('date')
+                or r.get('일자')
+            )
+
+            # 상대팀 컬럼 추출 (우선순위: OPPONENT)
+            opp = (
+                r.get('OPPONENT')
+                or r.get('opponent')
+                or r.get('상대')
+                or ''
+            )
+
             game_id = ''
-            ymd = dobj.strftime('%Y%m%d')
-            # try to resolve abbreviations
-            opp_key = (opp or '').strip()
-            # direct map from team name -> abbr
-            opp_abbr = team_map.get(opp_key)
-            player_abbr = team_map.get(player_team) if player_team else None
-            # fallback: if opponent already looks like an abbr (2-3 uppercase), use it
-            if not opp_abbr and isinstance(opp_key, str) and opp_key.isupper() and 1 < len(opp_key) <= 3:
-                opp_abbr = opp_key
-            # if we have both abbrs, try both possible orderings and verify against games_index if available
-            if player_abbr and opp_abbr:
-                # prefer opp as away, player as home
-                candidate1 = f"{ymd}{opp_abbr}{player_abbr}0"
-                candidate2 = f"{ymd}{player_abbr}{opp_abbr}0"
-                # if games_index was attached to team_abbr_map (tuple), handle accordingly
-                game_id = ''
-                # if games_index is available (we unpacked it earlier), prefer verified lookup
-                if games_index is not None:
-                    k1 = (ymd, opp_abbr, player_abbr)
-                    k2 = (ymd, player_abbr, opp_abbr)
-                    game_id = games_index.get(k1) or games_index.get(k2) or ''
-                else:
-                    # best-effort: assume game exists and use candidate1
-                    game_id = candidate1
+
+            # 날짜와 상대팀이 둘 다 있어야 매칭 시도
+            if date_s and opp:
+                date_key = normalize_date(date_s)
+                opp_key = str(opp).strip()
+                if date_key and opp_key:
+                    game_id = games_index.get((date_key, opp_key), '')
+
+            # 기존 row에 GAME_ID 추가
             newrow = {k: v for k, v in r.items()}
-            newrow['game_id'] = game_id
-            # maintain order
+            newrow['GAME_ID'] = game_id
+
+            # 필드 순서를 ['GAME_ID'] + 기존 필드 순서로 맞춰서 기록
             ordered = {fn: newrow.get(fn, '') for fn in out_fields}
             writer.writerow(ordered)
             rows_processed += 1
-    # replace original
+
+    # 임시 파일로 원본 파일 교체
     os.replace(tmp_path, path)
     return rows_processed
 
 
 def main():
-    player_history = load_player_history(PTH_PLAYER_HISTORY)
-    total = 0
-    # build team abbr and games index from ETL combined games file
-    team_abbr_map, games_index, abbr_set = build_games_index_and_abbr(PTH_ALL_GAMES)
-    combined_team_map = (team_abbr_map, games_index, abbr_set)
+    # 1) 통합 Games_all 파일에서 (GAME_DATE, 팀) → GAME_ID 인덱스 생성
+    games_index = build_games_index_by_date_and_team(PTH_ALL_GAMES)
 
-    # process combined ETL daily files first
+    total = 0
+
+    # 2) 통합 daily 파일(타자/투수)을 먼저 처리
     for fn in (PTH_ALL_HITTER, PTH_ALL_PITCHER):
-        n = process_daily_file(fn, player_history, combined_team_map)
+        n = process_daily_file(fn, games_index)
         print(f'Processed {n} rows for {fn}')
         total += n
 
-    # also attempt per-year files (backwards compatible)
+    # 3) 연도별 daily 파일도 동일한 인덱스로 처리
     for y in YEARS:
-        games_all = os.path.join(ROOT, 'data', str(y), 'game_info', f'{y}_Games_all.csv')
-        team_abbr = build_team_abbrev_map(games_all)
         for kind in ('hitter', 'pitcher'):
-            fn = os.path.join(ROOT, 'data', str(y), 'player_stats', f'{y}_{kind}_daily.csv')
-            # prefer using combined games index when available
-            n = process_daily_file(fn, player_history, combined_team_map if team_abbr_map else team_abbr)
+            fn = os.path.join(
+                ROOT, 'data', str(y), 'player_stats', f'{y}_{kind}_daily.csv'
+            )
+            n = process_daily_file(fn, games_index)
             print(f'Processed {n} rows for {fn}')
             total += n
 
     print('Done. Total rows processed:', total)
+
 
 if __name__ == '__main__':
     main()

@@ -1,4 +1,4 @@
-﻿year,game_id,date,stadium,team_away,team_home,status,crowd,time_start,time_end,time_run,score_away,score_home
+﻿YEAR,GAME_ID,GAME_DATE,STADIUM,TEAM_AWAY,TEAM_HOME,STATUS,CROWD,TIME_START,TIME_END,TIME_RUN,SCORE_AWAY,SCORE_HOME
 2021,20210403HTOB0,2021-04-03,잠실,KIA,두산,canceled,,,,,,
 2021,20210403LTSK0,2021-04-03,문학,롯데,SSG,canceled,,,,,,
 2021,20210403LGNC0,2021-04-03,창원,LG,NC,canceled,,,,,,
